@@ -1,0 +1,13 @@
+version: 2
+
+project_name: tcloud-installer
+
+builds:
+  - skip: true
+
+release:
+  draft: false
+
+# Documentation: https://goreleaser.com/customization/changelog/
+changelog:
+  use: github
