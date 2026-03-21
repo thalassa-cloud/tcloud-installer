@@ -1,0 +1,206 @@
+# action.yml
+name: tcloud-installer
+author: thalassa-cloud
+description: 'Installs the tcloud CLI from thalassa-cloud/cli and adds it to your PATH'
+branding:
+  icon: 'package'
+  color: 'blue'
+inputs:
+  tcloud-release:
+    description: 'Release to install: a tag (e.g. v0.18.0), latest, or main (build from source with go install)'
+    required: false
+    default: 'latest'
+  install-dir:
+    description: 'Directory for the tcloud binary'
+    required: false
+    default: '$HOME/.tcloud-cli'
+  use-sudo:
+    description: 'Set to true if install-dir requires elevated permissions'
+    required: false
+    default: 'false'
+runs:
+  using: "composite"
+  steps:
+    - shell: bash
+      env:
+        input_tcloud_release: ${{ inputs.tcloud-release }}
+        input_install_dir: ${{ inputs.install-dir }}
+        input_use_sudo: ${{ inputs.use-sudo }}
+        runner_arch: ${{ runner.arch }}
+        runner_os: ${{ runner.os }}
+      run: |
+        #!/bin/bash
+        install_dir=$(envsubst <<<"${input_install_dir}")
+
+        shopt -s expand_aliases
+        if [ -z "$NO_COLOR" ]; then
+          alias log_info="echo -e \"\033[1;32mINFO\033[0m:\""
+          alias log_error="echo -e \"\033[1;31mERROR\033[0m:\""
+        else
+          alias log_info="echo \"INFO:\""
+          alias log_error="echo \"ERROR:\""
+        fi
+        set -euo pipefail
+
+        CURL_RETRIES=3
+        REPO="thalassa-cloud/cli"
+        BASE_URL="https://github.com/${REPO}/releases/download"
+
+        # Resolve latest semver tag via GitHub's /releases/latest redirect (same idea as curl-only installers).
+        resolve_latest_tag() {
+          local url
+          url="$(curl --retry "${CURL_RETRIES}" -fsSL -o /dev/null -w '%{url_effective}' -L "https://github.com/${REPO}/releases/latest")"
+          case "${url}" in
+            */releases/tag/*)
+              echo "${url##*/}"
+              ;;
+            *)
+              log_error "Could not resolve latest release (unexpected redirect URL: ${url})"
+              exit 1
+              ;;
+          esac
+        }
+
+        is_semver_tag() {
+          [[ "$1" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]
+        }
+
+        map_platform() {
+          case ${runner_os} in
+            Linux|linux)
+              case ${runner_arch} in
+                X64|amd64) echo "linux_amd64" ;;
+                ARM64|arm64) echo "linux_arm64" ;;
+                *)
+                  log_error "unsupported architecture ${runner_arch} on Linux"
+                  exit 1
+                  ;;
+              esac
+              ;;
+            macOS|macos)
+              case ${runner_arch} in
+                X64|amd64) echo "darwin_amd64" ;;
+                ARM64|arm64) echo "darwin_arm64" ;;
+                *)
+                  log_error "unsupported architecture ${runner_arch} on macOS"
+                  exit 1
+                  ;;
+              esac
+              ;;
+            Windows|windows)
+              case ${runner_arch} in
+                X64|amd64) echo "windows_amd64" ;;
+                ARM64|arm64) echo "windows_arm64" ;;
+                *)
+                  log_error "unsupported architecture ${runner_arch} on Windows"
+                  exit 1
+                  ;;
+              esac
+              ;;
+            *)
+              log_error "unsupported OS ${runner_os}"
+              exit 1
+              ;;
+          esac
+        }
+
+        SUDO=
+        if [[ "${input_use_sudo}" == "true" ]] && command -v sudo >/dev/null 2>&1; then
+          SUDO=sudo
+        fi
+
+        rel="${input_tcloud_release}"
+        [[ -z "${rel}" ]] && rel="latest"
+
+        $SUDO mkdir -p "${install_dir}"
+
+        if [[ "${rel}" == "main" ]]; then
+          if ! command -v go >/dev/null 2>&1; then
+            log_error "Go is required when tcloud-release is main"
+            exit 1
+          fi
+          log_info "Installing tcloud via go install from github.com/${REPO}@main"
+          go install "github.com/${REPO}@main"
+          GOBIN="$(go env GOPATH)/bin"
+          if [[ "${runner_os}" == Windows ]] || [[ "${runner_os}" == windows ]]; then
+            if [[ -x "${GOBIN}/tcloud.exe" ]]; then
+              $SUDO cp "${GOBIN}/tcloud.exe" "${install_dir}/tcloud.exe"
+            elif [[ -x "${GOBIN}/cli.exe" ]]; then
+              $SUDO cp "${GOBIN}/cli.exe" "${install_dir}/tcloud.exe"
+            else
+              log_error "go install did not produce cli.exe or tcloud.exe in ${GOBIN}"
+              exit 1
+            fi
+          else
+            if [[ -x "${GOBIN}/tcloud" ]]; then
+              $SUDO cp "${GOBIN}/tcloud" "${install_dir}/tcloud"
+            elif [[ -x "${GOBIN}/cli" ]]; then
+              $SUDO cp "${GOBIN}/cli" "${install_dir}/tcloud"
+            else
+              log_error "go install did not produce cli or tcloud in ${GOBIN}"
+              exit 1
+            fi
+            $SUDO chmod +x "${install_dir}/tcloud"
+          fi
+          log_info "Installation complete."
+          exit 0
+        fi
+
+        if [[ "${rel}" == "latest" ]]; then
+          tag="$(resolve_latest_tag)"
+          log_info "Resolved latest tag: ${tag}"
+        else
+          tag="${rel}"
+          if ! is_semver_tag "${tag}"; then
+            log_error "Invalid release tag '${tag}'. Use a semver tag like v0.18.0, latest, or main."
+            exit 1
+          fi
+        fi
+
+        ver="${tag#v}"
+        plat="$(map_platform)"
+        asset="tcloud_${ver}_${plat}.tar.gz"
+        url="${BASE_URL}/${tag}/${asset}"
+
+        log_info "Downloading ${asset} from ${url}"
+        tmp="$(mktemp -d)"
+        trap 'rm -rf "${tmp}"' EXIT
+        if ! curl --retry "${CURL_RETRIES}" -fsSL "${url}" -o "${tmp}/archive.tar.gz"; then
+          log_error "Failed to download release asset. Check that tag '${tag}' exists on https://github.com/${REPO}/releases"
+          exit 1
+        fi
+
+        tar -xzf "${tmp}/archive.tar.gz" -C "${tmp}"
+
+        if [[ "${runner_os}" == Windows ]] || [[ "${runner_os}" == windows ]]; then
+          bin="$(find "${tmp}" -maxdepth 3 \( -name tcloud.exe -o -name tcloud \) -type f | head -1)"
+        else
+          bin="$(find "${tmp}" -maxdepth 3 -name tcloud -type f | head -1)"
+        fi
+
+        if [[ -z "${bin}" ]] || [[ ! -f "${bin}" ]]; then
+          log_error "Could not find tcloud binary inside ${asset}"
+          exit 1
+        fi
+
+        if [[ "${runner_os}" == Windows ]] || [[ "${runner_os}" == windows ]]; then
+          $SUDO cp "${bin}" "${install_dir}/tcloud.exe"
+        else
+          $SUDO cp "${bin}" "${install_dir}/tcloud"
+          $SUDO chmod +x "${install_dir}/tcloud"
+        fi
+        log_info "Installation complete."
+
+    - if: ${{ runner.os == 'Linux' || runner.os == 'macOS' }}
+      shell: bash
+      env:
+        input_install_dir: ${{ inputs.install-dir }}
+      run: envsubst <<<"${input_install_dir}" >> "$GITHUB_PATH"
+
+    - if: ${{ runner.os == 'Windows' }}
+      shell: pwsh
+      env:
+        input_install_dir: ${{ inputs.install-dir }}
+      run: |
+        $install_dir = $ExecutionContext.InvokeCommand.ExpandString("${env:input_install_dir}")
+        echo "${install_dir}" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
