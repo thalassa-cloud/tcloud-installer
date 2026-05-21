@@ -241,7 +241,6 @@ jobs:
           - ubuntu-latest
           - windows-latest
         go_version:
-          - '1.25'
           - '1.26'
     name: try to install tcloud with go ${{ matrix.go_version }} on ${{ matrix.os }}
     steps:
